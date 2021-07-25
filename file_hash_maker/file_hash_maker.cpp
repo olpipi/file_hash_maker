@@ -1,12 +1,12 @@
 
 #include <iostream>
-#include <openssl/md5.h>
+#include "openssl_wrapper.h"
 
 #define MAX_PATH_LEN 256
 
 char inputFileName[MAX_PATH_LEN] = "input.bin";
 char outputFileName[MAX_PATH_LEN] = "output.txt";
-uint32_t blockSizeInByte = 1024 * 1024;
+uint32_t blockSizeInChar = 1024 * 1024;
 
 std::shared_ptr<FILE> inputFile, outputFile;
 
@@ -19,7 +19,7 @@ void readFromKeyboard()
     std::cin >> outputFileName;
 
     std::cout << "block size: ";
-    std::cin >> blockSizeInByte;
+    std::cin >> blockSizeInChar;
 }
 
 auto closeFile = [](FILE* ptr)
@@ -45,9 +45,9 @@ bool OpenFile()
     return true;
 }
 
-bool WriteHash(unsigned char* value)
+bool WriteHash(std::unique_ptr<unsigned char[]> pValue, uint32_t size)
 {
-    if (MD5_DIGEST_LENGTH != fwrite(value, 1, MD5_DIGEST_LENGTH, outputFile.get()))
+    if (size != fwrite(pValue.get(), sizeof(unsigned char), size, outputFile.get()))
         return false;
 
     return true;
@@ -55,33 +55,33 @@ bool WriteHash(unsigned char* value)
 
 bool CalcHash()
 {
-    char* inputBuffer = new char[blockSizeInByte];
+    size_t readBytes = 0;
+    std::unique_ptr<unsigned char[]> inputBuffer = nullptr;
+    std::unique_ptr<unsigned char[]> md5digest = nullptr;
 
-    MD5_CTX md5handler = {};
-    unsigned char md5digest[MD5_DIGEST_LENGTH] = {};
-
-    while (blockSizeInByte == fread_s(inputBuffer, blockSizeInByte, sizeof(char), blockSizeInByte, inputFile.get()))
+    do
     {
-        if (1 != MD5_Init(&md5handler))
+        auto inputBuffer = std::make_unique<unsigned char[]>(blockSizeInChar);
+
+        readBytes = fread_s(inputBuffer.get(), blockSizeInChar, sizeof(unsigned char), blockSizeInChar, inputFile.get());
+        if (!readBytes)
+            break; //EOF
+
+        try
+        {
+            md5digest = MD5Hash::CalsHash(std::move(inputBuffer), blockSizeInChar);
+        }
+        catch (MD5Exception& e)
+        {
+            std::cout << "Got an exception from MD5 calculator: " << e.what() << "\n";
             return false;
-        if (1 != MD5_Update(&md5handler, static_cast<const void*>(inputBuffer), blockSizeInByte))
-            return false;
-        if (1 != MD5_Final(md5digest, &md5handler))
+        }
+
+        if (!WriteHash(std::move(md5digest), MD5_DIGEST_LENGTH))
             return false;
 
-        if (!WriteHash(md5digest))
-            return false;
-    }
+    } while (readBytes == blockSizeInChar);
 
-    if (1 != MD5_Init(&md5handler))
-        return false;
-    if (1 != MD5_Update(&md5handler, static_cast<const void*>(inputBuffer), blockSizeInByte))
-        return false;
-    if (1 != MD5_Final(md5digest, &md5handler))
-        return false;
-
-    if (!WriteHash(md5digest))
-        return false;
 
     return true;
 }
