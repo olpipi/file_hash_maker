@@ -4,14 +4,14 @@
 #include <queue>
 #include <mutex>
 #include <thread>
-
+#include <execution>
 #include "openssl_wrapper.h"
 
 #define MAX_PATH_LEN 256
 
 char inputFileName[MAX_PATH_LEN] = "input.bin";
 char outputFileName[MAX_PATH_LEN] = "output.txt";
-uint32_t blockSizeInChar = 1024 * 1024;
+uint32_t blockSizeInChar = 1024 * 1024 * 50;
 
 std::shared_ptr<FILE> inputFile, outputFile;
 
@@ -72,50 +72,67 @@ struct Task
     Task() = delete;
 };
 
+
 std::queue<std::unique_ptr<Task>> taskQueue;
 std::mutex taskQueueMutex;
 
 std::vector<std::pair<uint32_t, std::unique_ptr<unsigned char[]>>> hashVector;
 std::mutex hashVectorMutex;
 
-std::condition_variable cv;
+std::condition_variable cvNewTask;
+std::condition_variable cvTaskDone;
 
+std::atomic<bool> stoppedFlag{ false };
+
+uint32_t memoryLimitInMb = 100;
+//uint32 is enough up to 4GB
 
 void producer()
 {
+    uint32_t maxTaskCount = (memoryLimitInMb * 1024 * 1024) / (blockSizeInChar * sizeof(unsigned char));
+
     size_t readBytes = 0;
 
-    for (uint32_t index = 0;; index++)
+    for (uint32_t index = 0; !stoppedFlag.load(std::memory_order_relaxed); index++)
     {
+        {
+            std::unique_lock<std::mutex> lock{ taskQueueMutex };
+            cvTaskDone.wait(lock, [&maxTaskCount]
+                {
+                    return taskQueue.size() < maxTaskCount;
+                });
+        }
+
         auto newTask = std::make_unique<Task>(blockSizeInChar, index);
         readBytes = fread_s(newTask->inputBuffer.get(), blockSizeInChar, sizeof(unsigned char), blockSizeInChar, inputFile.get());
         
         if (!readBytes)
             break;
+
         {
             std::lock_guard<std::mutex> lock{ taskQueueMutex };
             taskQueue.push(std::move(newTask));
         }
 
-        cv.notify_one();
+        cvNewTask.notify_one();
     }
 
     {
         std::lock_guard<std::mutex> lock{ taskQueueMutex };
         taskQueue.push(nullptr);
     }
-    cv.notify_all();
+    cvNewTask.notify_all();
 }
 
 void consumer() {
     std::unique_ptr<Task> newTask = nullptr;
     std::unique_ptr<unsigned char[]> md5digest = nullptr;
 
-    for (;;)
+    while (!stoppedFlag.load(std::memory_order_relaxed))
     {
         {
             std::unique_lock<std::mutex> lock{ taskQueueMutex };
-            cv.wait(lock, []
+            cvNewTask.wait(lock, []
                 {
                     return !taskQueue.empty();
                 });
@@ -126,6 +143,8 @@ void consumer() {
             taskQueue.pop();
         }
 
+        cvTaskDone.notify_one();
+
         try
         {
             md5digest = MD5Hash::CalsHash(std::move(newTask->inputBuffer), blockSizeInChar);
@@ -133,6 +152,7 @@ void consumer() {
         catch (MD5Exception& e)
         {
             std::cout << "Got an exception from MD5 calculator: " << e.what() << "\n";
+            stoppedFlag.store(true, std::memory_order_relaxed);
             return;
         }
 
@@ -145,21 +165,24 @@ void consumer() {
 }
 
 
-
-
 int main()
 {
-    uint32_t numThreads = 4;
     //readFromKeyboard();
 
     if (!OpenFile())
         return -1;
 
+
+    uint32_t hwConcurency = std::thread::hardware_concurrency();
+    uint32_t numThreads = !hwConcurency ? 2 : hwConcurency;
+
+    //change std::thread to async to return error code via futures
     std::thread prod(&producer);
+    
 
     std::vector<std::thread> cons;
     for (uint32_t i = 0; i < numThreads; i++) {
-        cons.emplace_back([] {consumer();});
+        cons.emplace_back(&consumer);
     }
 
     prod.join();
@@ -168,7 +191,7 @@ int main()
 
     auto qq = hashVector[0].first;
 
-    std::sort(hashVector.begin(), hashVector.end(), [](auto& left, auto& right) {
+    std::sort(std::execution::par,hashVector.begin(), hashVector.end(), [](auto& left, auto& right) {
         return left.first < right.first; });
 
     for (uint32_t i = 0; i < hashVector.size(); i++)
@@ -179,5 +202,5 @@ int main()
     inputFile.reset();
     outputFile.reset();
 
-    return 0;
+    return 0;     
 }
