@@ -6,8 +6,7 @@
 #include <thread>
 #include <execution>
 #include <future>
-#include "openssl_wrapper.h"
-
+#include "openssl/md5.h"
 #define MAX_PATH_LEN 256
 
 char inputFileName[MAX_PATH_LEN] = "input.bin";
