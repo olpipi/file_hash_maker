@@ -5,13 +5,14 @@
 #include <mutex>
 #include <thread>
 #include <execution>
+#include <future>
 #include "openssl_wrapper.h"
 
 #define MAX_PATH_LEN 256
 
 char inputFileName[MAX_PATH_LEN] = "input.bin";
 char outputFileName[MAX_PATH_LEN] = "output.txt";
-uint32_t blockSizeInChar = 1024 * 1024 * 50;
+uint32_t blockSizeInChar = 1024 * 1024;
 
 std::shared_ptr<FILE> inputFile, outputFile;
 
@@ -20,17 +21,43 @@ void closeFile(FILE* ptr)
     fclose(ptr);
 };
 
-void readFromKeyboard()
+
+
+class MyCustomException : public std::exception
 {
-    std::cout << "input file: ";
-    std::cin >> inputFileName;
+public:
+    MyCustomException(char const* const _Message) noexcept
+        :std::exception(_Message)
+    {}
+};
 
-    std::cout << "output file: ";
-    std::cin >> outputFileName;
 
-    std::cout << "block size: ";
-    std::cin >> blockSizeInChar;
-}
+class MD5Hash
+{
+public:
+    
+    //return size is always == MD5_DIGEST_LENGTH
+    static std::unique_ptr<unsigned char[]> CalsHash(std::unique_ptr<unsigned char[]> dataToHash, uint32_t size)
+    {
+        MD5_CTX md5Ctx{};
+        auto md5digest = std::make_unique<unsigned char[]>(MD5_DIGEST_LENGTH);
+
+        if (1 != MD5_Init(&md5Ctx))
+            throw MyCustomException("failed to init MD5 hash");
+
+        if (1 != MD5_Update(&md5Ctx, static_cast<const void*>(dataToHash.get()), size))
+            throw MyCustomException("failed to put data for MD5");
+
+        if (1 != MD5_Final(md5digest.get(), &md5Ctx))
+            throw MyCustomException("failed to get result from MD5");
+
+        return md5digest;
+    }
+};
+
+
+
+
 
 
 
@@ -51,12 +78,10 @@ bool OpenFile()
     return true;
 }
 
-bool WriteHash(std::unique_ptr<unsigned char[]> pValue, uint32_t size)
+void WriteHash(std::unique_ptr<unsigned char[]> pValue, uint32_t size)
 {
     if (size != fwrite(pValue.get(), sizeof(unsigned char), size, outputFile.get()))
-        return false;
-
-    return true;
+        throw MyCustomException("cannot write to file");
 }
 
 struct Task
@@ -106,9 +131,13 @@ void producer()
         auto newTask = std::make_unique<Task>(blockSizeInChar, index);
         readBytes = fread_s(newTask->inputBuffer.get(), blockSizeInChar, sizeof(unsigned char), blockSizeInChar, inputFile.get());
         
-        if (!readBytes)
-            break;
+        if (!readBytes) 
+        {
+            if (ferror(inputFile.get()))
+                throw MyCustomException("cannot read from file");
 
+            break; //EOF
+        }
         {
             std::lock_guard<std::mutex> lock{ taskQueueMutex };
             taskQueue.push(std::move(newTask));
@@ -118,6 +147,7 @@ void producer()
     }
 
     {
+        //nullptr task to stop consumers
         std::lock_guard<std::mutex> lock{ taskQueueMutex };
         taskQueue.push(nullptr);
     }
@@ -149,11 +179,10 @@ void consumer() {
         {
             md5digest = MD5Hash::CalsHash(std::move(newTask->inputBuffer), blockSizeInChar);
         }
-        catch (MD5Exception& e)
+        catch (MyCustomException& e)
         {
-            std::cout << "Got an exception from MD5 calculator: " << e.what() << "\n";
             stoppedFlag.store(true, std::memory_order_relaxed);
-            return;
+            throw e;
         }
 
         {
@@ -164,10 +193,21 @@ void consumer() {
     }
 }
 
+void readFromKeyboard()
+{
+    std::cout << "input file: ";
+    std::cin >> inputFileName;
+
+    std::cout << "output file: ";
+    std::cin >> outputFileName;
+
+    std::cout << "block size in bytes: ";
+    std::cin >> blockSizeInChar;
+}
 
 int main()
 {
-    //readFromKeyboard();
+    readFromKeyboard();
 
     if (!OpenFile())
         return -1;
@@ -176,27 +216,57 @@ int main()
     uint32_t hwConcurency = std::thread::hardware_concurrency();
     uint32_t numThreads = !hwConcurency ? 2 : hwConcurency;
 
-    //change std::thread to async to return error code via futures
-    std::thread prod(&producer);
+    //launch producer
+    auto prodF = std::async(std::launch::async, producer);
     
-
-    std::vector<std::thread> cons;
+    //launch consumers
+    std::vector<std::future<void>> consF(numThreads);
     for (uint32_t i = 0; i < numThreads; i++) {
-        cons.emplace_back(&consumer);
+        consF[i] = std::async(std::launch::async, consumer);
     }
 
-    prod.join();
-    for (uint32_t i = 0; i < numThreads; i++)
-        cons[i].join();
-
-    auto qq = hashVector[0].first;
-
-    std::sort(std::execution::par,hashVector.begin(), hashVector.end(), [](auto& left, auto& right) {
-        return left.first < right.first; });
-
-    for (uint32_t i = 0; i < hashVector.size(); i++)
+    bool success = true;
+    //wait for threads to finish
+    try
     {
-        WriteHash(std::move(hashVector[i].second), MD5_DIGEST_LENGTH);
+        prodF.get();
+    }
+    catch (MyCustomException& e)
+    {
+        std::cout << "Got an exception from producer: " << e.what() << "\n";
+        success = false;
+    }
+    for (uint32_t i = 0; i < numThreads; i++)
+    {
+        try
+        {
+            consF[i].get();
+        }
+        catch (MyCustomException& e)
+        {
+            std::cout << "Got an exception from consumer: " << e.what() << "\n";
+            success = false;
+        }
+    }
+
+    if (success)
+    {
+        //get results together
+        std::sort(std::execution::par, hashVector.begin(), hashVector.end(), [](auto& left, auto& right) {
+            return left.first < right.first; });
+
+        for (uint32_t i = 0; i < hashVector.size(); i++)
+        {
+            try
+            {
+                WriteHash(std::move(hashVector[i].second), MD5_DIGEST_LENGTH);
+            }
+            catch (MyCustomException& e)
+            {
+                std::cout << "Got an exception: " << e.what() << "\n";
+                break;
+            }
+        }
     }
 
     inputFile.reset();
